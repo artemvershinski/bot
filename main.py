@@ -646,7 +646,7 @@ def main():
         return
     
     # Проверка, что токен валидный
-    if not BOT_TOKEN.startswith("7") or ":" not in BOT_TOKEN:
+    if not BOT_TOKEN or ":" not in BOT_TOKEN:
         logger.error("❌ Неверный формат BOT_TOKEN!")
         return
     
@@ -662,4 +662,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
