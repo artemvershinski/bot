@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: telegram-message-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+    healthCheckPath: /health
+    autoDeploy: true
