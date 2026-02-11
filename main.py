@@ -385,7 +385,7 @@ class MessageForwardingBot:
                     "• <code>/admin add ID</code> - добавить администратора\n"
                     "• <code>/admin remove ID</code> - удалить администратора\n"
                     "• <code>/admin list</code> - список администраторов\n\n"
-                    "<i>Владелец бота (ID: {OWNER_ID}) всегда является администратором</i>"
+                    f"<i>Владелец бота (ID: {OWNER_ID}) всегда является администратором</i>"
                 )
             elif len(text) >= 3:
                 action = text[1].lower()
@@ -448,16 +448,16 @@ class MessageForwardingBot:
             
             elif len(text) == 2 and text[1].lower() == "list":
                 admins = await self.db.get_admins()
-                text = "👑 <b>Список администраторов:</b>\n\n"
+                admin_list_text = "👑 <b>Список администраторов:</b>\n\n"
                 
                 for i, admin_id in enumerate(admins, 1):
                     user_data = await self.db.get_user(admin_id) or {}
                     if admin_id == OWNER_ID:
-                        text += f"{i}. 👑 {self.get_user_info(user_data)} | <code>{admin_id}</code> (владелец)\n"
+                        admin_list_text += f"{i}. 👑 {self.get_user_info(user_data)} | <code>{admin_id}</code> (владелец)\n"
                     else:
-                        text += f"{i}. {self.get_user_info(user_data)} | <code>{admin_id}</code>\n"
+                        admin_list_text += f"{i}. {self.get_user_info(user_data)} | <code>{admin_id}</code>\n"
                 
-                await message.answer(text)
+                await message.answer(admin_list_text)
         
         @self.router.message(Command("ban"))
         async def cmd_ban(message: Message):
@@ -532,12 +532,16 @@ class MessageForwardingBot:
                 
                 # Уведомление заблокированного пользователя
                 try:
+                    ban_info_text = ""
+                    if hours:
+                        ban_info_text = f"<b>Разблокировка:</b> {ban_until.strftime('%d.%m.%Y в %H:%M')}\n\n"
+                    
                     await self.bot.send_message(
                         peer_id,
                         f"🚫 <b>Вы заблокированы</b>\n\n"
                         f"<b>Причина:</b> {reason}\n"
                         f"<b>Длительность:</b> {ban_duration}\n\n"
-                        f"{'' if not hours else f'<b>Разблокировка:</b> {ban_until.strftime("%d.%m.%Y в %H:%M")}\n\n'}"
+                        f"{ban_info_text}"
                         f"<i>Если вы считаете, что это ошибка, свяжитесь с администратором.</i>"
                     )
                 except Exception as e:
@@ -885,6 +889,7 @@ class MessageForwardingBot:
     
     async def run(self):
         """Запуск бота"""
+        runner = None
         try:
             # Настройка сигналов для Unix
             if sys.platform != 'win32':
@@ -915,8 +920,10 @@ class MessageForwardingBot:
             logger.error(f"Критическая ошибка: {e}")
         finally:
             await self.bot.session.close()
-            await self.db.close()
-            await runner.cleanup()
+            if hasattr(self, 'db') and self.db:
+                await self.db.close()
+            if runner:
+                await runner.cleanup()
 
 def main():
     """Точка входа"""
