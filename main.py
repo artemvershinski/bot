@@ -12,9 +12,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from keep_alive import create_keep_alive_server
 from aiohttp import web
 import json
-from datetime import timezone
 
-# Конфигурация
+# Конфигурация — НИКАКИХ ТАЙМЗОН, БЛЯДЬ!
 OWNER_ID = 989062605
 RATE_LIMIT_MINUTES = 10
 MAX_BAN_HOURS = 720
@@ -83,7 +82,7 @@ class Database:
                 )
             ''')
             
-            # СОЗДАЕМ ПОЛЬЗОВАТЕЛЯ-ВЛАДЕЛЬЦА ПЕРЕД ДОБАВЛЕНИЕМ В АДМИНЫ
+            # СОЗДАЕМ ПОЛЬЗОВАТЕЛЯ-ВЛАДЕЛЬЦА НАХУЙ
             await conn.execute('''
                 INSERT INTO users (user_id, username, first_name) 
                 VALUES ($1, 'owner', 'Owner')
@@ -312,31 +311,35 @@ class MessageForwardingBot:
         return f"ID: {user_data['user_id']}"
     
     async def check_ban_status(self, user_id: int) -> tuple[bool, str]:
-        """Проверка статуса блокировки"""
+        """Проверка статуса блокировки - ИСПРАВЛЕНО, БЛЯДЬ!"""
         user_data = await self.db.get_user(user_id)
         if not user_data or not user_data.get('is_banned'):
             return False, ""
         
         ban_until = user_data.get('ban_until')
-        if ban_until and datetime.now(timezone.utc) > ban_until.replace(tzinfo=timezone.utc):
-            await self.db.unban_user(user_id)
-            return False, ""
-        
         if ban_until:
+            # Убираем timezone нахуй если есть
+            if hasattr(ban_until, 'tzinfo') and ban_until.tzinfo:
+                ban_until = ban_until.replace(tzinfo=None)
+            if datetime.now() > ban_until:
+                await self.db.unban_user(user_id)
+                return False, ""
             return True, f"до {ban_until.strftime('%d.%m.%Y %H:%M')}"
         return True, "навсегда"
     
     async def check_rate_limit(self, user_id: int) -> tuple[bool, int]:
-        """Проверка лимита сообщений"""
+        """Проверка лимита сообщений - ИСПРАВЛЕНО, СУКА!"""
         user_data = await self.db.get_user(user_id)
         if not user_data or not user_data.get('last_message_time'):
             return True, 0
         
         last_time = user_data['last_message_time']
-        if last_time.tzinfo:
-            last_time = last_time.replace(tzinfo=timezone.utc)
+        # Убираем timezone если есть
+        if hasattr(last_time, 'tzinfo') and last_time.tzinfo:
+            last_time = last_time.replace(tzinfo=None)
         
-        time_diff = (datetime.now(timezone.utc) - last_time).total_seconds() / 60
+        # НИКАКИХ timezone.utc, просто now()
+        time_diff = (datetime.now() - last_time).total_seconds() / 60
         if time_diff < RATE_LIMIT_MINUTES:
             return False, RATE_LIMIT_MINUTES - int(time_diff)
         return True, 0
@@ -502,7 +505,8 @@ class MessageForwardingBot:
                 except:
                     await self.db.save_user(user_id=peer_id)
                 
-                ban_until = datetime.now(timezone.utc) + timedelta(hours=hours) if hours else None
+                # datetime.now() БЕЗ timezone, ПОНЯЛ?!
+                ban_until = datetime.now() + timedelta(hours=hours) if hours else None
                 await self.db.ban_user(peer_id, reason, ban_until)
                 await self.db.update_stats(bans_issued=1)
                 
@@ -528,7 +532,7 @@ class MessageForwardingBot:
                     exclude_user_id=message.from_user.id
                 )
                 
-                # ИСПРАВЛЕННАЯ СТРОКА 540 - ТЕПЕРЬ РАБОТАЕТ
+                # Уведомление заблокированного пользователя - ИСПРАВЛЕНО
                 try:
                     ban_info_text = ""
                     if hours:
@@ -740,7 +744,8 @@ class MessageForwardingBot:
                         logger.error(f"Ошибка отправки админу {admin_id}: {e}")
                 
                 if success_count > 0:
-                    await self.db.update_user_last_message(user_id, datetime.now(timezone.utc))
+                    # datetime.now() БЕЗ timezone, БЛЯДЬ!
+                    await self.db.update_user_last_message(user_id, datetime.now())
                     await self.db.update_user_stats(user_id, increment_messages=True)
                     await self.db.update_stats(successful_forwards=success_count)
                     
