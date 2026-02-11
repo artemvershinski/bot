@@ -15,11 +15,11 @@ import json
 from datetime import timezone
 
 # Конфигурация
-OWNER_ID = 989062605  # Владелец бота (нельзя удалить/забанить)
+OWNER_ID = 989062605
 RATE_LIMIT_MINUTES = 10
 MAX_BAN_HOURS = 720
 KEEP_ALIVE_PORT = int(os.getenv("PORT", 8080))
-DATABASE_URL = os.getenv("DATABASE_URL")  # Переменная окружения для PostgreSQL
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,6 +83,15 @@ class Database:
                 )
             ''')
             
+            # СОЗДАЕМ ПОЛЬЗОВАТЕЛЯ-ВЛАДЕЛЬЦА ПЕРЕД ДОБАВЛЕНИЕМ В АДМИНЫ
+            await conn.execute('''
+                INSERT INTO users (user_id, username, first_name) 
+                VALUES ($1, 'owner', 'Owner')
+                ON CONFLICT (user_id) DO UPDATE SET
+                    username = 'owner',
+                    first_name = 'Owner'
+            ''', OWNER_ID)
+            
             # Добавляем владельца как администратора
             await conn.execute('''
                 INSERT INTO admins (user_id, added_by) 
@@ -90,7 +99,7 @@ class Database:
                 ON CONFLICT (user_id) DO NOTHING
             ''', OWNER_ID)
             
-            # Инициализируем статистику если её нет
+            # Инициализируем статистику
             await conn.execute('''
                 INSERT INTO stats (id, total_messages, successful_forwards, failed_forwards, bans_issued, rate_limit_blocks)
                 VALUES (1, 0, 0, 0, 0, 0)
@@ -106,17 +115,14 @@ class Database:
     async def save_user(self, user_id: int, **kwargs):
         """Сохранение или обновление пользователя"""
         async with self.pool.acquire() as conn:
-            # Проверяем существует ли пользователь
             exists = await conn.fetchval('SELECT EXISTS(SELECT 1 FROM users WHERE user_id = $1)', user_id)
             
             if exists:
-                # Обновляем существующего
                 set_clause = ', '.join([f"{k} = ${i+2}" for i, k in enumerate(kwargs.keys())])
                 set_clause += ", updated_at = CURRENT_TIMESTAMP"
                 query = f'UPDATE users SET {set_clause} WHERE user_id = $1'
                 await conn.execute(query, user_id, *kwargs.values())
             else:
-                # Создаем нового
                 fields = ['user_id'] + list(kwargs.keys())
                 values = [user_id] + list(kwargs.values())
                 placeholders = ', '.join([f'${i+1}' for i in range(len(values))])
@@ -194,7 +200,7 @@ class Database:
     async def remove_admin(self, user_id: int) -> bool:
         """Удаление администратора"""
         if user_id == OWNER_ID:
-            return False  # Нельзя удалить владельца
+            return False
         try:
             async with self.pool.acquire() as conn:
                 await conn.execute('DELETE FROM admins WHERE user_id = $1', user_id)
@@ -283,7 +289,7 @@ class MessageForwardingBot:
         self.router = Router()
         self.dp.include_router(self.router)
         self.is_running = True
-        self.cached_admins = []  # Кэш администраторов
+        self.cached_admins = []
         self.register_handlers()
     
     async def notify_admins(self, message: str, exclude_user_id: int = None):
@@ -360,7 +366,6 @@ class MessageForwardingBot:
                 f"<b>Просто отправьте ваше сообщение.</b>"
             )
             
-            # Уведомление администраторам о новом пользователе
             user_data = await self.db.get_user(message.from_user.id)
             await self.notify_admins(
                 f"👤 <b>Новый пользователь запустил бота:</b>\n"
@@ -372,13 +377,11 @@ class MessageForwardingBot:
         
         @self.router.message(Command("admin"))
         async def cmd_admin(message: Message):
-            """Управление администраторами"""
             if not await self.db.is_admin(message.from_user.id):
                 return await message.answer("❌ У вас нет прав для использования этой команды.")
             
             text = message.text.split()
             if len(text) == 1:
-                # Показываем список команд
                 await message.answer(
                     "👑 <b>Управление администраторами</b>\n\n"
                     "<b>Команды:</b>\n"
@@ -396,7 +399,6 @@ class MessageForwardingBot:
                         if target_id == OWNER_ID:
                             return await message.answer("👑 Владелец уже является администратором.")
                         
-                        # Сохраняем пользователя если его нет
                         try:
                             user = await self.bot.get_chat(target_id)
                             await self.db.save_user(
@@ -417,7 +419,6 @@ class MessageForwardingBot:
                                 f"Добавил: {message.from_user.first_name}"
                             )
                             
-                            # Уведомляем нового администратора
                             try:
                                 await self.bot.send_message(
                                     target_id,
@@ -478,7 +479,6 @@ class MessageForwardingBot:
                 
                 peer_id = int(args[0])
                 
-                # Проверяем, не является ли пользователь администратором
                 if await self.db.is_admin(peer_id):
                     return await message.answer("❌ Нельзя заблокировать администратора.")
                 
@@ -491,7 +491,6 @@ class MessageForwardingBot:
                         f"(максимум {MAX_BAN_HOURS // 24} дней)"
                     )
                 
-                # Сохраняем пользователя если его нет
                 try:
                     user = await self.bot.get_chat(peer_id)
                     await self.db.save_user(
@@ -519,7 +518,6 @@ class MessageForwardingBot:
                     f"<i>Заблокировал: {message.from_user.first_name}</i>"
                 )
                 
-                # Уведомление другим администраторам
                 await self.notify_admins(
                     f"🔨 <b>Пользователь заблокирован</b>\n\n"
                     f"Пользователь: {self.get_user_info(user_data)}\n"
@@ -530,7 +528,7 @@ class MessageForwardingBot:
                     exclude_user_id=message.from_user.id
                 )
                 
-                # Уведомление заблокированного пользователя
+                # ИСПРАВЛЕННАЯ СТРОКА 540 - ТЕПЕРЬ РАБОТАЕТ
                 try:
                     ban_info_text = ""
                     if hours:
@@ -575,7 +573,6 @@ class MessageForwardingBot:
                         f"<b>Был заблокирован за:</b> {user_data.get('ban_reason', 'Не указано')}"
                     )
                     
-                    # Уведомление другим администраторам
                     await self.notify_admins(
                         f"✅ <b>Пользователь разблокирован</b>\n\n"
                         f"Пользователь: {self.get_user_info(user_data)}\n"
@@ -687,13 +684,9 @@ class MessageForwardingBot:
         async def handle_user_message(message: Message):
             user_id = message.from_user.id
             
-            # Обновляем статистику
             await self.db.update_stats(total_messages=1)
-            
-            # Сохраняем пользователя
             await self.save_user_from_message(message)
             
-            # Проверяем блокировку
             is_banned, ban_info = await self.check_ban_status(user_id)
             if is_banned:
                 user_data = await self.db.get_user(user_id)
@@ -703,7 +696,6 @@ class MessageForwardingBot:
                     f"<i>Если вы считаете, что это ошибка, свяжитесь с администратором.</i>"
                 )
             
-            # Проверяем лимит сообщений (для обычных пользователей)
             if not await self.db.is_admin(user_id):
                 can_send, remaining = await self.check_rate_limit(user_id)
                 if not can_send:
@@ -715,7 +707,6 @@ class MessageForwardingBot:
                     )
             
             try:
-                # Формируем подпись для сообщения
                 user_data = await self.db.get_user(user_id)
                 caption = (
                     f"📩 <b>Новое сообщение от {self.get_user_info(user_data)}</b>\n"
@@ -723,7 +714,6 @@ class MessageForwardingBot:
                     f"<b>Время:</b> {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n"
                 )
                 
-                # Отправляем всем администраторам
                 admins = await self.db.get_admins()
                 handlers = {
                     ContentType.TEXT: self.handle_text,
@@ -741,7 +731,6 @@ class MessageForwardingBot:
                 
                 handler = handlers.get(message.content_type, self.handle_unknown)
                 
-                # Отправляем сообщение каждому администратору
                 success_count = 0
                 for admin_id in admins:
                     try:
@@ -751,7 +740,6 @@ class MessageForwardingBot:
                         logger.error(f"Ошибка отправки админу {admin_id}: {e}")
                 
                 if success_count > 0:
-                    # Обновляем статистику пользователя
                     await self.db.update_user_last_message(user_id, datetime.now(timezone.utc))
                     await self.db.update_user_stats(user_id, increment_messages=True)
                     await self.db.update_stats(successful_forwards=success_count)
@@ -781,7 +769,6 @@ class MessageForwardingBot:
                     f"<i>Код ошибки: {type(e).__name__}</i>"
                 )
                 
-                # Уведомление администраторам об ошибке
                 await self.notify_admins(
                     f"⚠️ <b>Ошибка при получении сообщения</b>\n\n"
                     f"<b>От:</b> {self.get_user_info(user_data)}\n"
@@ -876,7 +863,7 @@ class MessageForwardingBot:
         runner = web.AppRunner(app)
         await runner.setup()
         await web.TCPSite(runner, '0.0.0.0', KEEP_ALIVE_PORT).start()
-        logger.info(f"Keep-alive сервер запущен на порту {KEEP_ALIVE_PORT}")
+        logger.info(f"✅ Keep-alive сервер запущен на порту {KEEP_ALIVE_PORT}")
         return runner
     
     async def shutdown(self, sig=None):
@@ -891,13 +878,11 @@ class MessageForwardingBot:
         """Запуск бота"""
         runner = None
         try:
-            # Настройка сигналов для Unix
             if sys.platform != 'win32':
                 loop = asyncio.get_running_loop()
                 for sig in [signal.SIGTERM, signal.SIGINT]:
                     loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self.shutdown(s)))
             
-            # Запуск keep-alive сервера
             runner = await self.start_keep_alive_server()
             
             logger.info("🤖 Бот запускается...")
@@ -905,7 +890,6 @@ class MessageForwardingBot:
             logger.info(f"⏱ Лимит сообщений: {RATE_LIMIT_MINUTES} минут")
             logger.info(f"🌐 Keep-alive порт: {KEEP_ALIVE_PORT}")
             
-            # Основной цикл
             while self.is_running:
                 try:
                     await self.dp.start_polling(self.bot)
@@ -927,7 +911,6 @@ class MessageForwardingBot:
 
 def main():
     """Точка входа"""
-    # Проверка наличия токена
     BOT_TOKEN = os.getenv("BOT_TOKEN")
     if not BOT_TOKEN:
         logger.error("❌ Не найден BOT_TOKEN в переменных окружения!")
@@ -936,14 +919,12 @@ def main():
         logger.error("❌ Неверный формат BOT_TOKEN!")
         return
     
-    # Проверка наличия DATABASE_URL
     DATABASE_URL = os.getenv("DATABASE_URL")
     if not DATABASE_URL:
         logger.error("❌ Не найден DATABASE_URL в переменных окружения!")
         logger.error("📌 Добавьте переменную DATABASE_URL в настройках Render (Internal Database)")
         return
     
-    # Инициализация и запуск
     async def run_bot():
         db = Database(DATABASE_URL)
         await db.create_pool()
