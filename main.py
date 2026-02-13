@@ -655,6 +655,99 @@ class MessageForwardingBot:
                 text += f"\n<i>Показано 50 из {len(users)} пользователей</i>"
             
             await message.answer(text)
+
+        @self.router.message(Command("love"))
+        async def cmd_love(message: Message):
+            """Команда /love для администраторов (регистронезависимая)"""
+            if not await self.db.is_admin(message.from_user.id):
+                return
+            
+            # Отправляем реквизиты
+            msg = await message.answer("💳 Резквизиты для возврата денег за цветы: 2200 7008 9394 1392")
+            await asyncio.sleep(2)
+            await msg.delete()
+            
+            await asyncio.sleep(0.5)
+            await message.answer("Ладно, это была шутка)")
+            await asyncio.sleep(1)
+            
+            await message.answer("Теперь тебе кое-что предстоит..")
+            await asyncio.sleep(1)
+            
+            await message.answer("Ты же знаешь, что я недавно мессенджер свой создал")
+            await asyncio.sleep(1)
+            
+            await message.answer("Так вот у тебя даже там аккаунт уже есть, представляешь")
+            await asyncio.sleep(1)
+            
+            # Почта и пароль моноширным шрифтом для копирования
+            await message.answer("Почта: <code>nastya@cute.so</code> (копируется нажатием)")
+            await asyncio.sleep(1)
+            
+            await message.answer("Пароль: <code>imCute</code> (копируется нажатием)")
+            await asyncio.sleep(1)
+            
+            await message.answer("Сейчас вышлю инструкцию, что делать дальше))")
+            await asyncio.sleep(3)
+            
+            await message.answer(
+                "Сейчас тебе необходимо зайти в аккаунт под этой почтой и паролем\n"
+                "Далее нажать кнопку \"Присоединиться\", затем ввести айди чата \"14FEB\"\n"
+                "Дальше ты сама все поймешь)\n"
+                "Ниже скину ссылку"
+            )
+            await asyncio.sleep(1)
+            
+            # Кнопка с ссылкой
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="👉 ТЫКАЙ 👈", url="https://chaters-8ylq.onrender.com")]
+                ]
+            )
+            await message.answer("ТЫКАЙ", reply_markup=keyboard)
+            await asyncio.sleep(1)
+            
+            await message.answer("Если вдруг что то будет не получаться, пиши мне в лс (не в бота)")
+        
+        @self.router.message(Command("cute"))
+        async def cmd_cute(message: Message):
+            """Команда /cute для администраторов"""
+            if not await self.db.is_admin(message.from_user.id):
+                return
+            
+            await message.answer("Я надеюсь, что тебе еще не надоело))")
+            await asyncio.sleep(1)
+            
+            await message.answer("Сейчас тебе прийдется посетить еще один сайт, который был разработан специально для тебя")
+            await asyncio.sleep(1)
+            
+            await message.answer("Ровно через 60 минут ссылка появится тут")
+            await asyncio.sleep(1)
+            
+            # Обратный отсчет 60:00 -> 59:59 -> 59:58 -> 59:57
+            timer_msg = await message.answer("⏳ Обратный отсчет 60:00")
+            await asyncio.sleep(1)
+            
+            for i in range(3):  # 59:59, 59:58, 59:57
+                seconds = 59 - i
+                await timer_msg.edit_text(f"⏳ Обратный отсчет 59:{seconds:02d}")
+                await asyncio.sleep(0.5)
+            
+            # Останавливаемся и отправляем новое сообщение
+            await asyncio.sleep(0.5)
+            await message.answer("Ладно, вот ссылка))")
+            await asyncio.sleep(1)
+            
+            # Кнопка с ссылкой
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="📱 Скачать MAX", url="https://valentinka-for-you.onrender.com")]
+                ]
+            )
+            await message.answer("Скачать MAX", reply_markup=keyboard)
+            await asyncio.sleep(1)
+            
+            await message.answer("Если что, коммуницировать с ботом больше не прийдется))")
         
         @self.router.message(Command("help"))
         async def cmd_help(message: Message):
@@ -670,6 +763,9 @@ class MessageForwardingBot:
                     "• /ban ID причина [часы] - заблокировать\n"
                     "• /unban ID - разблокировать\n"
                     "• /users - список пользователей\n\n"
+                    "🎁 <b>Специальные команды:</b>\n"
+                    "• /love - секретная команда\n"
+                    "• /cute - еще одна секретная команда\n\n"
                     "📊 <b>Статистика:</b>\n"
                     "• /stats - статистика бота\n"
                     "• /help - это сообщение\n\n"
