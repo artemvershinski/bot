@@ -494,9 +494,8 @@ class MessageForwardingBot:
             
             await self.bot.send_message(
                 user_id,
-                f"📨 <b>Ответ на ваше сообщение #{message_id}</b>\n\n"
+                f"<b>Ответ на ваше сообщение #{message_id}</b>\n\n"
                 f"{answer_text}\n\n"
-                f"<i>Ответил: {admin_name}</i>"
             )
             
             # Отмечаем сообщение как отвеченное
@@ -1068,11 +1067,9 @@ class MessageForwardingBot:
                     
                     await message.answer(
                         f"✅ <b>Сообщение #{message_id} успешно отправлено!</b>\n\n"
-                        f"<b>Важная информация:</b>\n"
-                        f"• Ответ придет вам в личные сообщения (ЛС)\n"
-                        f"• Ваше сообщение сохранится под номером #{message_id}\n"
-                        f"• Следующее сообщение можно отправить через {RATE_LIMIT_MINUTES} минут\n"
-                        f"• Пожалуйста, пишите всё в одном сообщении"
+                        f"Ответ поступит в личные сообщения либо в боте\n"
+                        f"Ваше сообщение сохранится под номером #{message_id}\n"
+                        f"Следующее сообщение можно отправить через {RATE_LIMIT_MINUTES} минут\n"
                     )
                     
                     logger.info(f"Сообщение #{message_id} от {user_id} успешно переслано {success_count} админам")
@@ -1350,3 +1347,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
