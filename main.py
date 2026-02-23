@@ -12,13 +12,15 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from keep_alive import create_keep_alive_server
 from aiohttp import web
 import json
+import re
 
-# Конфигурация — НИКАКИХ ТАЙМЗОН, БЛЯДЬ!
+# Конфигурация
 OWNER_ID = 989062605
 RATE_LIMIT_MINUTES = 10
 MAX_BAN_HOURS = 720
 KEEP_ALIVE_PORT = int(os.getenv("PORT", 8080))
 DATABASE_URL = os.getenv("DATABASE_URL")
+MESSAGE_ID_START = 100569  # Начальный ID для сообщений
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,6 +60,23 @@ class Database:
                 )
             ''')
             
+            # Таблица сообщений
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS messages (
+                    message_id INTEGER PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    content_type TEXT NOT NULL,
+                    file_id TEXT,
+                    caption TEXT,
+                    text TEXT,
+                    forwarded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_answered BOOLEAN DEFAULT FALSE,
+                    answered_by BIGINT,
+                    answered_at TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+                )
+            ''')
+            
             # Таблица администраторов
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS admins (
@@ -78,11 +97,27 @@ class Database:
                     failed_forwards INTEGER DEFAULT 0,
                     bans_issued INTEGER DEFAULT 0,
                     rate_limit_blocks INTEGER DEFAULT 0,
+                    answers_sent INTEGER DEFAULT 0,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             
-            # СОЗДАЕМ ПОЛЬЗОВАТЕЛЯ-ВЛАДЕЛЬЦА НАХУЙ
+            # Таблица для хранения последнего ID сообщения
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS message_counter (
+                    id INTEGER PRIMARY KEY,
+                    last_message_id INTEGER NOT NULL
+                )
+            ''')
+            
+            # Инициализируем счетчик сообщений
+            await conn.execute('''
+                INSERT INTO message_counter (id, last_message_id) 
+                VALUES (1, $1) 
+                ON CONFLICT (id) DO NOTHING
+            ''', MESSAGE_ID_START)
+            
+            # СОЗДАЕМ ПОЛЬЗОВАТЕЛЯ-ВЛАДЕЛЬЦА
             await conn.execute('''
                 INSERT INTO users (user_id, username, first_name) 
                 VALUES ($1, 'owner', 'Owner')
@@ -100,10 +135,56 @@ class Database:
             
             # Инициализируем статистику
             await conn.execute('''
-                INSERT INTO stats (id, total_messages, successful_forwards, failed_forwards, bans_issued, rate_limit_blocks)
-                VALUES (1, 0, 0, 0, 0, 0)
+                INSERT INTO stats (id, total_messages, successful_forwards, failed_forwards, bans_issued, rate_limit_blocks, answers_sent)
+                VALUES (1, 0, 0, 0, 0, 0, 0)
                 ON CONFLICT (id) DO NOTHING
             ''')
+    
+    async def get_next_message_id(self) -> int:
+        """Получение следующего ID сообщения"""
+        async with self.pool.acquire() as conn:
+            result = await conn.fetchrow('''
+                UPDATE message_counter 
+                SET last_message_id = last_message_id + 1 
+                WHERE id = 1 
+                RETURNING last_message_id
+            ''')
+            return result['last_message_id']
+    
+    async def save_message(self, message_id: int, user_id: int, content_type: str, 
+                          file_id: str = None, caption: str = None, text: str = None):
+        """Сохранение сообщения"""
+        async with self.pool.acquire() as conn:
+            await conn.execute('''
+                INSERT INTO messages (message_id, user_id, content_type, file_id, caption, text)
+                VALUES ($1, $2, $3, $4, $5, $6)
+            ''', message_id, user_id, content_type, file_id, caption, text)
+    
+    async def get_message(self, message_id: int) -> Optional[Dict]:
+        """Получение сообщения по ID"""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow('SELECT * FROM messages WHERE message_id = $1', message_id)
+            return dict(row) if row else None
+    
+    async def mark_message_answered(self, message_id: int, answered_by: int):
+        """Отметить сообщение как отвеченное"""
+        async with self.pool.acquire() as conn:
+            await conn.execute('''
+                UPDATE messages 
+                SET is_answered = TRUE, answered_by = $2, answered_at = CURRENT_TIMESTAMP
+                WHERE message_id = $1
+            ''', message_id, answered_by)
+    
+    async def get_user_messages(self, user_id: int, limit: int = 10) -> List[Dict]:
+        """Получение сообщений пользователя"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch('''
+                SELECT * FROM messages 
+                WHERE user_id = $1 
+                ORDER BY forwarded_at DESC 
+                LIMIT $2
+            ''', user_id, limit)
+            return [dict(row) for row in rows]
     
     async def get_user(self, user_id: int) -> Optional[Dict]:
         """Получение пользователя по ID"""
@@ -243,7 +324,8 @@ class Database:
                     'successful_forwards': 0,
                     'failed_forwards': 0,
                     'bans_issued': 0,
-                    'rate_limit_blocks': 0
+                    'rate_limit_blocks': 0,
+                    'answers_sent': 0
                 }
             return dict(row)
     
@@ -272,6 +354,16 @@ class Database:
                 LIMIT 1
             ''')
             return dict(row) if row else None
+    
+    async def get_messages_stats(self) -> Dict:
+        """Получение статистики по сообщениям"""
+        async with self.pool.acquire() as conn:
+            total = await conn.fetchval('SELECT COUNT(*) FROM messages')
+            answered = await conn.fetchval('SELECT COUNT(*) FROM messages WHERE is_answered = TRUE')
+            return {
+                'total': total,
+                'answered': answered
+            }
     
     async def close(self):
         """Закрытие соединения с БД"""
@@ -311,14 +403,13 @@ class MessageForwardingBot:
         return f"ID: {user_data['user_id']}"
     
     async def check_ban_status(self, user_id: int) -> tuple[bool, str]:
-        """Проверка статуса блокировки - ИСПРАВЛЕНО, БЛЯДЬ!"""
+        """Проверка статуса блокировки"""
         user_data = await self.db.get_user(user_id)
         if not user_data or not user_data.get('is_banned'):
             return False, ""
         
         ban_until = user_data.get('ban_until')
         if ban_until:
-            # Убираем timezone нахуй если есть
             if hasattr(ban_until, 'tzinfo') and ban_until.tzinfo:
                 ban_until = ban_until.replace(tzinfo=None)
             if datetime.now() > ban_until:
@@ -328,17 +419,15 @@ class MessageForwardingBot:
         return True, "навсегда"
     
     async def check_rate_limit(self, user_id: int) -> tuple[bool, int]:
-        """Проверка лимита сообщений - ИСПРАВЛЕНО, СУКА!"""
+        """Проверка лимита сообщений"""
         user_data = await self.db.get_user(user_id)
         if not user_data or not user_data.get('last_message_time'):
             return True, 0
         
         last_time = user_data['last_message_time']
-        # Убираем timezone если есть
         if hasattr(last_time, 'tzinfo') and last_time.tzinfo:
             last_time = last_time.replace(tzinfo=None)
         
-        # НИКАКИХ timezone.utc, просто now()
         time_diff = (datetime.now() - last_time).total_seconds() / 60
         if time_diff < RATE_LIMIT_MINUTES:
             return False, RATE_LIMIT_MINUTES - int(time_diff)
@@ -356,83 +445,114 @@ class MessageForwardingBot:
             last_name=user.last_name
         )
     
-    async def cmd_love_logic(self, message: Message):
-        """Логика команды love"""
-        await message.answer("💳 Резквизиты для возврата денег за цветы: 2200 7008 9394 1392")
-        await asyncio.sleep(2)
+    async def handle_answer_command(self, message: Message):
+        """Обработка команды ответа по ID сообщения"""
+        if not await self.db.is_admin(message.from_user.id):
+            return
         
-        await message.answer("Ладно, это была шутка)")
-        await asyncio.sleep(1)
+        # Парсим команду: #ID текст ответа
+        text = message.text.strip()
+        match = re.match(r'^#(\d+)\s+(.+)$', text, re.DOTALL)
         
-        await message.answer("Теперь тебе кое-что предстоит..")
-        await asyncio.sleep(1)
+        if not match:
+            return
         
-        await message.answer("Ты же знаешь, что я недавно мессенджер свой создал")
-        await asyncio.sleep(1)
+        message_id = int(match.group(1))
+        answer_text = match.group(2).strip()
         
-        await message.answer("Так вот у тебя даже там аккаунт уже есть, представляешь")
-        await asyncio.sleep(1)
+        # Получаем исходное сообщение
+        original_message = await self.db.get_message(message_id)
+        if not original_message:
+            await message.answer(f"❌ Сообщение с ID #{message_id} не найдено")
+            return
         
-        await message.answer("Почта: <code>nastya@cute.so</code> (копируется нажатием)")
-        await asyncio.sleep(1)
+        user_id = original_message['user_id']
         
-        await message.answer("Пароль: <code>imCute</code> (копируется нажатием)")
-        await asyncio.sleep(1)
+        # Проверяем не забанен ли пользователь
+        is_banned, _ = await self.check_ban_status(user_id)
+        if is_banned:
+            await message.answer("❌ Нельзя ответить заблокированному пользователю")
+            return
         
-        await message.answer("Сейчас вышлю инструкцию, что делать дальше))")
-        await asyncio.sleep(3)
-        
-        await message.answer(
-            "Сейчас тебе необходимо зайти в аккаунт под этой почтой и паролем\n"
-            "Далее нажать кнопку \"Присоединиться\", затем ввести айди чата \"14FEB\"\n"
-            "Дальше ты сама все поймешь)\n"
-            "Ниже скину ссылку"
-        )
-        await asyncio.sleep(1)
-        
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="👉 ТЫКАЙ 👈", url="https://chaters-8ylq.onrender.com")]
-            ]
-        )
-        await message.answer("👉 ТЫКАЙ 👈", reply_markup=keyboard)
-        await asyncio.sleep(1)
-        
-        await message.answer("Если вдруг что то будет не получаться, пиши мне в лс (не в бота)")
+        try:
+            # Отправляем ответ пользователю
+            admin_info = await self.db.get_user(message.from_user.id)
+            admin_name = self.get_user_info(admin_info) if admin_info else f"ID: {message.from_user.id}"
+            
+            await self.bot.send_message(
+                user_id,
+                f"📨 <b>Ответ на ваше сообщение #{message_id}</b>\n\n"
+                f"{answer_text}\n\n"
+                f"<i>Ответил: {admin_name}</i>"
+            )
+            
+            # Отмечаем сообщение как отвеченное
+            await self.db.mark_message_answered(message_id, message.from_user.id)
+            await self.db.update_stats(answers_sent=1)
+            
+            # Подтверждение админу
+            user_info = await self.db.get_user(user_id)
+            await message.answer(
+                f"✅ <b>Ответ отправлен</b>\n\n"
+                f"<b>Сообщение:</b> #{message_id}\n"
+                f"<b>Пользователю:</b> {self.get_user_info(user_info)}\n"
+                f"<b>Текст ответа:</b>\n{answer_text[:200]}{'...' if len(answer_text) > 200 else ''}"
+            )
+            
+            # Уведомление других админов
+            await self.notify_admins(
+                f"💬 <b>Администратор ответил на сообщение</b>\n\n"
+                f"<b>Сообщение:</b> #{message_id}\n"
+                f"<b>Пользователь:</b> {self.get_user_info(user_info)}\n"
+                f"<b>Администратор:</b> {admin_name}\n"
+                f"<b>Текст ответа:</b>\n{answer_text[:200]}{'...' if len(answer_text) > 200 else ''}",
+                exclude_user_id=message.from_user.id
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка при ответе на сообщение #{message_id}: {e}")
+            await message.answer(
+                f"❌ <b>Не удалось отправить ответ</b>\n\n"
+                f"<b>Причина:</b> {str(e)}\n\n"
+                f"<i>Возможно, пользователь заблокировал бота</i>"
+            )
     
-    async def cmd_cute_logic(self, message: Message):
-        """Логика команды cute"""
-        await message.answer("Я надеюсь, что тебе еще не надоело))")
-        await asyncio.sleep(1)
-        
-        await message.answer("Сейчас тебе прийдется посетить еще один сайт, который был разработан специально для тебя")
-        await asyncio.sleep(1)
-        
-        await message.answer("Ровно через 60 минут ссылка появится тут")
-        await asyncio.sleep(1)
-        
-        timer_msg = await message.answer("⏳ Обратный отсчет 60:00")
-        await asyncio.sleep(1)
-        
-        # Отсчет до 59:53 (7 шагов: 59:59, 59:58, 59:57, 59:56, 59:55, 59:54, 59:53)
-        for i in range(7):
-            seconds = 59 - i
-            await timer_msg.edit_text(f"⏳ Обратный отсчет 59:{seconds:02d}")
-            await asyncio.sleep(0.5)
-        
-        await asyncio.sleep(0.5)
-        await message.answer("Ладно, вот ссылка))")
-        await asyncio.sleep(1)
-        
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="👉 ТЫКАЙ 👈", url="https://valentinka-for-you.onrender.com")]
-            ]
+    async def forward_message_to_admins(self, message: Message, user_data: Dict, message_id: int):
+        """Пересылка сообщения админам с ID"""
+        caption = (
+            f"📩 <b>Новое сообщение #{message_id}</b>\n"
+            f"<b>От:</b> {self.get_user_info(user_data)}\n"
+            f"<b>ID:</b> <code>{user_data['user_id']}</code>\n"
+            f"<b>Время:</b> {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+            f"<i>Чтобы ответить, отправьте: #{message_id} ваш ответ</i>\n"
         )
-        await message.answer("👉 ТЫКАЙ 👈", reply_markup=keyboard)
-        await asyncio.sleep(1)
         
-        await message.answer("Если что, коммуницировать с ботом больше не прийдется))")
+        admins = await self.db.get_admins()
+        handlers = {
+            ContentType.TEXT: self.handle_text,
+            ContentType.PHOTO: self.handle_photo,
+            ContentType.VIDEO: self.handle_video,
+            ContentType.VOICE: self.handle_voice,
+            ContentType.AUDIO: self.handle_audio,
+            ContentType.DOCUMENT: self.handle_document,
+            ContentType.LOCATION: self.handle_location,
+            ContentType.CONTACT: self.handle_contact,
+            ContentType.STICKER: self.handle_sticker,
+            ContentType.ANIMATION: self.handle_animation,
+            ContentType.VIDEO_NOTE: self.handle_video_note
+        }
+        
+        handler = handlers.get(message.content_type, self.handle_unknown)
+        
+        success_count = 0
+        for admin_id in admins:
+            try:
+                await handler(message, caption, admin_id, message_id)
+                success_count += 1
+            except Exception as e:
+                logger.error(f"Ошибка отправки админу {admin_id}: {e}")
+        
+        return success_count
     
     def register_handlers(self):
         @self.router.message(CommandStart())
@@ -440,9 +560,8 @@ class MessageForwardingBot:
             await self.save_user_from_message(message)
             await message.answer(
                 f"👋 <b>Привет, {message.from_user.first_name or 'пользователь'}!</b>\n\n"
-                f"Это бот-пересыльщик сообщений.\n"
+                f"Это бот для обратной связи.\n"
                 f"Задержка между отправкой сообщений - {RATE_LIMIT_MINUTES} минут.\n"
-                f"Пишите всё в одном сообщении.\n"
                 f"Поддерживаются любые типы сообщений.\n\n"
                 f"<b>Просто отправьте ваше сообщение.</b>"
             )
@@ -583,7 +702,6 @@ class MessageForwardingBot:
                 except:
                     await self.db.save_user(user_id=peer_id)
                 
-                # datetime.now() БЕЗ timezone, ПОНЯЛ?!
                 ban_until = datetime.now() + timedelta(hours=hours) if hours else None
                 await self.db.ban_user(peer_id, reason, ban_until)
                 await self.db.update_stats(bans_issued=1)
@@ -610,7 +728,6 @@ class MessageForwardingBot:
                     exclude_user_id=message.from_user.id
                 )
                 
-                # Уведомление заблокированного пользователя - ИСПРАВЛЕНО
                 try:
                     ban_info_text = ""
                     if hours:
@@ -684,6 +801,7 @@ class MessageForwardingBot:
             
             stats = await self.db.get_stats()
             user_stats = await self.db.get_users_count()
+            messages_stats = await self.db.get_messages_stats()
             most_active = await self.db.get_most_active_user()
             admins = await self.db.get_admins()
             
@@ -696,10 +814,13 @@ class MessageForwardingBot:
                 f"• Администраторов: {len(admins)}\n\n"
                 f"<b>Сообщения:</b>\n"
                 f"• Всего отправлено: {stats['total_messages']}\n"
+                f"• Всего сообщений в БД: {messages_stats['total']}\n"
+                f"• Отвеченных: {messages_stats['answered']}\n"
                 f"• Успешно переслано: {stats['successful_forwards']}\n"
                 f"• Ошибок при пересылке: {stats['failed_forwards']}\n"
                 f"• Блокировок по лимиту: {stats['rate_limit_blocks']}\n"
-                f"• Выдано банов: {stats['bans_issued']}\n\n"
+                f"• Выдано банов: {stats['bans_issued']}\n"
+                f"• Отправлено ответов: {stats['answers_sent']}\n\n"
             )
             
             if most_active and most_active.get('messages_sent', 0) > 0:
@@ -727,27 +848,79 @@ class MessageForwardingBot:
                 status = '🚫' if user.get('is_banned') else '✅'
                 is_admin = await self.db.is_admin(user['user_id'])
                 admin_star = '👑 ' if is_admin else ''
-                text += f"{i}. {status} {admin_star}{self.get_user_info(user)} | ID: <code>{user['user_id']}</code> | Сообщений: {user.get('messages_sent', 0)}\n"
+                
+                # Получаем последнее сообщение пользователя
+                last_msgs = await self.db.get_user_messages(user['user_id'], 1)
+                last_msg_info = ""
+                if last_msgs:
+                    last_msg_info = f" | Посл. #{last_msgs[0]['message_id']}"
+                
+                text += f"{i}. {status} {admin_star}{self.get_user_info(user)} | ID: <code>{user['user_id']}</code> | Сообщений: {user.get('messages_sent', 0)}{last_msg_info}\n"
             
             if len(users) > 50:
                 text += f"\n<i>Показано 50 из {len(users)} пользователей</i>"
             
             await message.answer(text)
-
+        
+        @self.router.message(Command("msg"))
+        async def cmd_msg(message: Message):
+            """Команда для просмотра информации о сообщении по ID"""
+            if not await self.db.is_admin(message.from_user.id):
+                return
+            
+            try:
+                args = message.text.split()
+                if len(args) < 2:
+                    return await message.answer("❌ Используйте: <code>/msg ID</code>")
+                
+                msg_id = int(args[1])
+                msg_data = await self.db.get_message(msg_id)
+                
+                if not msg_data:
+                    return await message.answer(f"❌ Сообщение #{msg_id} не найдено")
+                
+                user_data = await self.db.get_user(msg_data['user_id'])
+                status = "✅ Отвечено" if msg_data['is_answered'] else "⏳ Ожидает ответа"
+                
+                text = (
+                    f"📨 <b>Информация о сообщении #{msg_id}</b>\n\n"
+                    f"<b>Отправитель:</b> {self.get_user_info(user_data)}\n"
+                    f"<b>ID отправителя:</b> <code>{msg_data['user_id']}</code>\n"
+                    f"<b>Тип:</b> {msg_data['content_type']}\n"
+                    f"<b>Статус:</b> {status}\n"
+                    f"<b>Отправлено:</b> {msg_data['forwarded_at'].strftime('%d.%m.%Y %H:%M:%S')}\n"
+                )
+                
+                if msg_data['is_answered']:
+                    admin_data = await self.db.get_user(msg_data['answered_by'])
+                    admin_name = self.get_user_info(admin_data) if admin_data else f"ID: {msg_data['answered_by']}"
+                    text += f"<b>Ответил:</b> {admin_name}\n"
+                    text += f"<b>Время ответа:</b> {msg_data['answered_at'].strftime('%d.%m.%Y %H:%M:%S')}\n"
+                
+                if msg_data.get('text'):
+                    text += f"\n<b>Текст:</b>\n{msg_data['text'][:200]}{'...' if len(msg_data['text']) > 200 else ''}"
+                
+                await message.answer(text)
+                
+            except ValueError:
+                await message.answer("❌ Неверный формат ID")
+            except Exception as e:
+                await message.answer(f"❌ Ошибка: {str(e)}")
+        
         @self.router.message(Command("love"))
         async def cmd_love(message: Message):
             """Команда /love для администраторов"""
             if not await self.db.is_admin(message.from_user.id):
                 return
             await self.cmd_love_logic(message)
-
+        
         @self.router.message(Command("cute"))
         async def cmd_cute(message: Message):
             """Команда /cute для администраторов"""
             if not await self.db.is_admin(message.from_user.id):
                 return
             await self.cmd_cute_logic(message)
-
+        
         @self.router.message(F.text.lower().in_(["love", "cute"]))
         async def text_trigger(message: Message):
             """Обработка текстовых сообщений love/cute (без слеша)"""
@@ -773,6 +946,9 @@ class MessageForwardingBot:
                     "/ban ID причина [часы] - заблокировать\n"
                     "/unban ID - разблокировать\n"
                     "/users - список пользователей\n\n"
+                    "<b>Работа с сообщениями:</b>\n"
+                    "#ID текст ответа - ответить на сообщение\n"
+                    "/msg ID - информация о сообщении\n\n"
                     "<b>Статистика:</b>\n"
                     "/stats - статистика бота\n"
                     "/help - это сообщение\n\n"
@@ -789,6 +965,11 @@ class MessageForwardingBot:
         
         @self.router.message()
         async def handle_user_message(message: Message):
+            # Проверяем, не является ли это командой ответа от админа
+            if message.text and message.text.startswith('#'):
+                await self.handle_answer_command(message)
+                return
+            
             user_id = message.from_user.id
             
             await self.db.update_stats(total_messages=1)
@@ -814,53 +995,69 @@ class MessageForwardingBot:
                     )
             
             try:
-                user_data = await self.db.get_user(user_id)
-                caption = (
-                    f"📩 <b>Новое сообщение от {self.get_user_info(user_data)}</b>\n"
-                    f"<b>ID:</b> <code>{user_id}</code>\n"
-                    f"<b>Время:</b> {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+                # Получаем следующий ID сообщения
+                message_id = await self.db.get_next_message_id()
+                
+                # Сохраняем сообщение в БД
+                content_type = message.content_type.value if hasattr(message.content_type, 'value') else str(message.content_type)
+                
+                file_id = None
+                text = None
+                caption = None
+                
+                if message.content_type == ContentType.TEXT:
+                    text = message.text
+                elif message.photo:
+                    file_id = message.photo[-1].file_id
+                    caption = message.caption
+                elif message.video:
+                    file_id = message.video.file_id
+                    caption = message.caption
+                elif message.voice:
+                    file_id = message.voice.file_id
+                    caption = message.caption
+                elif message.audio:
+                    file_id = message.audio.file_id
+                    caption = message.caption
+                elif message.document:
+                    file_id = message.document.file_id
+                    caption = message.caption
+                elif message.sticker:
+                    file_id = message.sticker.file_id
+                elif message.animation:
+                    file_id = message.animation.file_id
+                    caption = message.caption
+                elif message.video_note:
+                    file_id = message.video_note.file_id
+                
+                await self.db.save_message(
+                    message_id=message_id,
+                    user_id=user_id,
+                    content_type=content_type,
+                    file_id=file_id,
+                    caption=caption,
+                    text=text
                 )
                 
-                admins = await self.db.get_admins()
-                handlers = {
-                    ContentType.TEXT: self.handle_text,
-                    ContentType.PHOTO: self.handle_photo,
-                    ContentType.VIDEO: self.handle_video,
-                    ContentType.VOICE: self.handle_voice,
-                    ContentType.AUDIO: self.handle_audio,
-                    ContentType.DOCUMENT: self.handle_document,
-                    ContentType.LOCATION: self.handle_location,
-                    ContentType.CONTACT: self.handle_contact,
-                    ContentType.STICKER: self.handle_sticker,
-                    ContentType.ANIMATION: self.handle_animation,
-                    ContentType.VIDEO_NOTE: self.handle_video_note
-                }
-                
-                handler = handlers.get(message.content_type, self.handle_unknown)
-                
-                success_count = 0
-                for admin_id in admins:
-                    try:
-                        await handler(message, caption, admin_id)
-                        success_count += 1
-                    except Exception as e:
-                        logger.error(f"Ошибка отправки админу {admin_id}: {e}")
+                # Пересылаем сообщение админам
+                user_data = await self.db.get_user(user_id)
+                success_count = await self.forward_message_to_admins(message, user_data, message_id)
                 
                 if success_count > 0:
-                    # datetime.now() БЕЗ timezone, БЛЯДЬ!
                     await self.db.update_user_last_message(user_id, datetime.now())
                     await self.db.update_user_stats(user_id, increment_messages=True)
                     await self.db.update_stats(successful_forwards=success_count)
                     
                     await message.answer(
-                        "<b>✅ Сообщение успешно отправлено!</b>\n\n"
-                        "<b>Важная информация:</b>\n"
-                        "• Ответ поступит только в личные сообщения (ЛС)\n"
+                        f"✅ <b>Сообщение #{message_id} успешно отправлено!</b>\n\n"
+                        f"<b>Важная информация:</b>\n"
+                        f"• Ответ придет вам в личные сообщения (ЛС)\n"
+                        f"• Ваше сообщение сохранится под номером #{message_id}\n"
                         f"• Следующее сообщение можно отправить через {RATE_LIMIT_MINUTES} минут\n"
-                        "• Пожалуйста, пишите всё в одном сообщении"
+                        f"• Пожалуйста, пишите всё в одном сообщении"
                     )
                     
-                    logger.info(f"Сообщение от {user_id} успешно переслано {success_count} админам")
+                    logger.info(f"Сообщение #{message_id} от {user_id} успешно переслано {success_count} админам")
                 else:
                     raise Exception("Не удалось отправить сообщение ни одному администратору")
             
@@ -885,10 +1082,10 @@ class MessageForwardingBot:
                     f"<b>Описание:</b> {str(e)[:200]}"
                 )
     
-    async def handle_text(self, message: Message, caption: str, admin_id: int):
+    async def handle_text(self, message: Message, caption: str, admin_id: int, message_id: int):
         await self.bot.send_message(admin_id, caption + f"💬 <b>Текст:</b>\n{message.text}")
     
-    async def handle_photo(self, message: Message, caption: str, admin_id: int):
+    async def handle_photo(self, message: Message, caption: str, admin_id: int, message_id: int):
         await self.bot.send_photo(
             admin_id,
             message.photo[-1].file_id,
@@ -896,7 +1093,7 @@ class MessageForwardingBot:
                     (f"\n\n<b>Подпись:</b>\n{message.caption}" if message.caption else "")
         )
     
-    async def handle_video(self, message: Message, caption: str, admin_id: int):
+    async def handle_video(self, message: Message, caption: str, admin_id: int, message_id: int):
         await self.bot.send_video(
             admin_id,
             message.video.file_id,
@@ -904,7 +1101,7 @@ class MessageForwardingBot:
                     (f"\n\n<b>Подпись:</b>\n{message.caption}" if message.caption else "")
         )
     
-    async def handle_voice(self, message: Message, caption: str, admin_id: int):
+    async def handle_voice(self, message: Message, caption: str, admin_id: int, message_id: int):
         await self.bot.send_voice(
             admin_id,
             message.voice.file_id,
@@ -912,7 +1109,7 @@ class MessageForwardingBot:
                     (f"\n\n<b>Подпись:</b>\n{message.caption}" if message.caption else "")
         )
     
-    async def handle_audio(self, message: Message, caption: str, admin_id: int):
+    async def handle_audio(self, message: Message, caption: str, admin_id: int, message_id: int):
         await self.bot.send_audio(
             admin_id,
             message.audio.file_id,
@@ -920,7 +1117,7 @@ class MessageForwardingBot:
                     (f"\n\n<b>Подпись:</b>\n{message.caption}" if message.caption else "")
         )
     
-    async def handle_document(self, message: Message, caption: str, admin_id: int):
+    async def handle_document(self, message: Message, caption: str, admin_id: int, message_id: int):
         await self.bot.send_document(
             admin_id,
             message.document.file_id,
@@ -928,7 +1125,7 @@ class MessageForwardingBot:
                     (f"\n\n<b>Подпись:</b>\n{message.caption}" if message.caption else "")
         )
     
-    async def handle_location(self, message: Message, caption: str, admin_id: int):
+    async def handle_location(self, message: Message, caption: str, admin_id: int, message_id: int):
         await self.bot.send_location(
             admin_id,
             message.location.latitude,
@@ -936,7 +1133,7 @@ class MessageForwardingBot:
         )
         await self.bot.send_message(admin_id, caption + "📍 <b>Геолокация</b>")
     
-    async def handle_contact(self, message: Message, caption: str, admin_id: int):
+    async def handle_contact(self, message: Message, caption: str, admin_id: int, message_id: int):
         await self.bot.send_contact(
             admin_id,
             message.contact.phone_number,
@@ -945,11 +1142,11 @@ class MessageForwardingBot:
         )
         await self.bot.send_message(admin_id, caption + "👤 <b>Контакт</b>")
     
-    async def handle_sticker(self, message: Message, caption: str, admin_id: int):
+    async def handle_sticker(self, message: Message, caption: str, admin_id: int, message_id: int):
         await self.bot.send_sticker(admin_id, message.sticker.file_id)
         await self.bot.send_message(admin_id, caption + "😊 <b>Стикер</b>")
     
-    async def handle_animation(self, message: Message, caption: str, admin_id: int):
+    async def handle_animation(self, message: Message, caption: str, admin_id: int, message_id: int):
         await self.bot.send_animation(
             admin_id,
             message.animation.file_id,
@@ -957,13 +1154,90 @@ class MessageForwardingBot:
                     (f"\n\n<b>Подпись:</b>\n{message.caption}" if message.caption else "")
         )
     
-    async def handle_video_note(self, message: Message, caption: str, admin_id: int):
+    async def handle_video_note(self, message: Message, caption: str, admin_id: int, message_id: int):
         await self.bot.send_video_note(admin_id, message.video_note.file_id)
         await self.bot.send_message(admin_id, caption + "📹 <b>Видеосообщение</b>")
     
-    async def handle_unknown(self, message: Message, caption: str, admin_id: int):
+    async def handle_unknown(self, message: Message, caption: str, admin_id: int, message_id: int):
         await self.bot.send_message(admin_id, caption + "❓ <b>Неизвестный тип сообщения</b>")
         await self.bot.send_message(admin_id, f"⚠️ Получен неподдерживаемый тип контента: {message.content_type}")
+    
+    async def cmd_love_logic(self, message: Message):
+        """Логика команды love"""
+        await message.answer("💳 Резквизиты для возврата денег за цветы: 2200 7008 9394 1392")
+        await asyncio.sleep(2)
+        
+        await message.answer("Ладно, это была шутка)")
+        await asyncio.sleep(1)
+        
+        await message.answer("Теперь тебе кое-что предстоит..")
+        await asyncio.sleep(1)
+        
+        await message.answer("Ты же знаешь, что я недавно мессенджер свой создал")
+        await asyncio.sleep(1)
+        
+        await message.answer("Так вот у тебя даже там аккаунт уже есть, представляешь")
+        await asyncio.sleep(1)
+        
+        await message.answer("Почта: <code>nastya@cute.so</code> (копируется нажатием)")
+        await asyncio.sleep(1)
+        
+        await message.answer("Пароль: <code>imCute</code> (копируется нажатием)")
+        await asyncio.sleep(1)
+        
+        await message.answer("Сейчас вышлю инструкцию, что делать дальше))")
+        await asyncio.sleep(3)
+        
+        await message.answer(
+            "Сейчас тебе необходимо зайти в аккаунт под этой почтой и паролем\n"
+            "Далее нажать кнопку \"Присоединиться\", затем ввести айди чата \"14FEB\"\n"
+            "Дальше ты сама все поймешь)\n"
+            "Ниже скину ссылку"
+        )
+        await asyncio.sleep(1)
+        
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="👉 ТЫКАЙ 👈", url="https://chaters-8ylq.onrender.com")]
+            ]
+        )
+        await message.answer("👉 ТЫКАЙ 👈", reply_markup=keyboard)
+        await asyncio.sleep(1)
+        
+        await message.answer("Если вдруг что то будет не получаться, пиши мне в лс (не в бота)")
+    
+    async def cmd_cute_logic(self, message: Message):
+        """Логика команды cute"""
+        await message.answer("Я надеюсь, что тебе еще не надоело))")
+        await asyncio.sleep(1)
+        
+        await message.answer("Сейчас тебе прийдется посетить еще один сайт, который был разработан специально для тебя")
+        await asyncio.sleep(1)
+        
+        await message.answer("Ровно через 60 минут ссылка появится тут")
+        await asyncio.sleep(1)
+        
+        timer_msg = await message.answer("⏳ Обратный отсчет 60:00")
+        await asyncio.sleep(1)
+        
+        for i in range(7):
+            seconds = 59 - i
+            await timer_msg.edit_text(f"⏳ Обратный отсчет 59:{seconds:02d}")
+            await asyncio.sleep(0.5)
+        
+        await asyncio.sleep(0.5)
+        await message.answer("Ладно, вот ссылка))")
+        await asyncio.sleep(1)
+        
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="👉 ТЫКАЙ 👈", url="https://valentinka-for-you.onrender.com")]
+            ]
+        )
+        await message.answer("👉 ТЫКАЙ 👈", reply_markup=keyboard)
+        await asyncio.sleep(1)
+        
+        await message.answer("Если что, коммуницировать с ботом больше не прийдется))")
     
     async def start_keep_alive_server(self):
         """Запуск keep-alive сервера"""
@@ -979,14 +1253,11 @@ class MessageForwardingBot:
         logger.info(f"Получен сигнал {sig}, завершение работы...")
         self.is_running = False
         
-        # Останавливаем polling
         await self.dp.stop_polling()
         logger.info("Polling остановлен")
         
-        # Закрываем сессию бота
         await self.bot.session.close()
         
-        # Закрываем соединение с БД
         await self.db.close()
         
         logger.info("Все соединения закрыты")
@@ -1002,7 +1273,6 @@ class MessageForwardingBot:
             
             runner = await self.start_keep_alive_server()
             
-            # ВАЖНО: Удаляем вебхук и сбрасываем старые обновления
             await self.bot.delete_webhook(drop_pending_updates=True)
             logger.info("✅ Вебхук удален, ожидающие обновления сброшены")
             
@@ -1010,6 +1280,7 @@ class MessageForwardingBot:
             logger.info(f"👑 Владелец бота: {OWNER_ID}")
             logger.info(f"⏱ Лимит сообщений: {RATE_LIMIT_MINUTES} минут")
             logger.info(f"🌐 Keep-alive порт: {KEEP_ALIVE_PORT}")
+            logger.info(f"🔢 ID сообщений начинаются с: #{MESSAGE_ID_START}")
             
             while self.is_running:
                 try:
@@ -1061,4 +1332,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
