@@ -1,10 +1,9 @@
 import asyncio, logging, os, sys, signal, asyncpg
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
-from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, ContentType, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import Message, ContentType, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart, Command
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -41,7 +40,7 @@ class Database:
         logger.info("✅ Подключение к PostgreSQL установлено")
     
     async def init_db(self):
-        """Инициализация таблиц"""
+        """Инициализация таблиц с проверкой существующих колонок"""
         async with self.pool.acquire() as conn:
             # Таблица пользователей
             await conn.execute('''
@@ -88,7 +87,7 @@ class Database:
                 )
             ''')
             
-            # Таблица статистики
+            # Таблица статистики - создаем без answers_sent сначала
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS stats (
                     id SERIAL PRIMARY KEY,
@@ -97,10 +96,16 @@ class Database:
                     failed_forwards INTEGER DEFAULT 0,
                     bans_issued INTEGER DEFAULT 0,
                     rate_limit_blocks INTEGER DEFAULT 0,
-                    answers_sent INTEGER DEFAULT 0,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            
+            # Проверяем и добавляем колонку answers_sent если её нет
+            try:
+                await conn.execute('SELECT answers_sent FROM stats LIMIT 1')
+            except asyncpg.UndefinedColumnError:
+                logger.info("Добавляем колонку answers_sent в таблицу stats")
+                await conn.execute('ALTER TABLE stats ADD COLUMN answers_sent INTEGER DEFAULT 0')
             
             # Таблица для хранения последнего ID сообщения
             await conn.execute('''
@@ -309,10 +314,18 @@ class Database:
     async def update_stats(self, **kwargs):
         """Обновление глобальной статистики"""
         async with self.pool.acquire() as conn:
-            set_clause = ', '.join([f"{k} = {k} + ${i+1}" for i, k in enumerate(kwargs.keys())])
-            set_clause += ", updated_at = CURRENT_TIMESTAMP"
-            query = f'UPDATE stats SET {set_clause} WHERE id = 1'
-            await conn.execute(query, *kwargs.values())
+            # Проверяем какие колонки существуют
+            columns = await conn.fetchrow('SELECT * FROM stats WHERE id = 1')
+            existing_columns = columns.keys() if columns else []
+            
+            # Фильтруем только существующие колонки
+            valid_kwargs = {k: v for k, v in kwargs.items() if k in existing_columns}
+            
+            if valid_kwargs:
+                set_clause = ', '.join([f"{k} = {k} + ${i+1}" for i, k in enumerate(valid_kwargs.keys())])
+                set_clause += ", updated_at = CURRENT_TIMESTAMP"
+                query = f'UPDATE stats SET {set_clause} WHERE id = 1'
+                await conn.execute(query, *valid_kwargs.values())
     
     async def get_stats(self) -> Dict:
         """Получение глобальной статистики"""
@@ -820,8 +833,13 @@ class MessageForwardingBot:
                 f"• Ошибок при пересылке: {stats['failed_forwards']}\n"
                 f"• Блокировок по лимиту: {stats['rate_limit_blocks']}\n"
                 f"• Выдано банов: {stats['bans_issued']}\n"
-                f"• Отправлено ответов: {stats['answers_sent']}\n\n"
             )
+            
+            # Добавляем answers_sent только если оно есть в stats
+            if 'answers_sent' in stats:
+                text += f"• Отправлено ответов: {stats['answers_sent']}\n"
+            
+            text += "\n"
             
             if most_active and most_active.get('messages_sent', 0) > 0:
                 text += (
